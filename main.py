@@ -21,19 +21,62 @@ llm = ChatGoogleGenerativeAI(
 patients = pd.read_csv("data/patients.csv").set_index("patient_id")
 
 def fetch_patient_data(patient_id):
-    """Fetch patient data and simulate claims/tasks"""
+    """Fetch patient data and simulate claims/tasks and include labs/imaging/encounters"""
+    # patients is already loaded at top as `patients = pd.read_csv("data/patients.csv").set_index("patient_id")`
     p = patients.loc[patient_id].to_dict()
+
+    # Claims (existing simple simulation)
     claims = [
         {
-            "claim_id": f"C{i}", 
-            "diagnosis": p["diagnosis"], 
-            "procedure": p["procedure"], 
+            "claim_id": f"C{i}",
+            "diagnosis": p["diagnosis"],
+            "procedure": p["procedure"],
             "amount": p["amount"]
-        } 
+        }
         for i in range(1, 6)
     ]
-    tasks = [{"task": p["task"]}] if p["task"] != "None" else []
-    return {"patient": p, "claims": claims, "tasks": tasks}
+
+    # Tasks: keep the existing approach
+    tasks = [{"task": p["task"]}] if p.get("task") and p["task"] != "None" else []
+
+    # Read supporting CSVs (expected to be in data/)
+    try:
+        labs_df = pd.read_csv("data/observations.csv")
+    except Exception:
+        labs_df = pd.DataFrame()
+    try:
+        imaging_df = pd.read_csv("data/ImagingStudies.csv")
+    except Exception:
+        imaging_df = pd.DataFrame()
+    try:
+        encounters_df = pd.read_csv("data/encounters.csv")
+    except Exception:
+        encounters_df = pd.DataFrame()
+
+    # Filter rows for this patient — column name might be `patient_id` or `id`
+    def filter_by_patient(df):
+        if df.empty:
+            return df
+        if "patient_id" in df.columns:
+            return df[df["patient_id"] == patient_id]
+        if "id" in df.columns:
+            return df[df["id"] == patient_id]
+        # if no matching column, return empty DataFrame
+        return df.iloc[0:0]
+
+    patient_labs = filter_by_patient(labs_df)
+    patient_imaging = filter_by_patient(imaging_df)
+    patient_encounters = filter_by_patient(encounters_df)
+
+    return {
+        "patient": p,
+        "claims": claims,
+        "tasks": tasks,
+        "labs": patient_labs.to_dict(orient="records"),
+        "imaging": patient_imaging.to_dict(orient="records"),
+        "encounters": patient_encounters.to_dict(orient="records"),
+    }
+
 
 # Define agent prompts
 identity_prompt = ChatPromptTemplate.from_messages([
@@ -62,24 +105,26 @@ Example: {{"billing_risk_score": 15, "billing_flags": ["normal_range"], "billing
 ])
 
 discharge_prompt = ChatPromptTemplate.from_messages([
-    ("system",  
-     "You are the MediGuard Discharge Agent. "
-     "Your job is to analyze pending tasks, missing records, incomplete labs, and determine "
-     "if the patient is ready for discharge. "
-     "ALWAYS return strictly valid JSON. No extra text."),
-     
-    ("human",  
-     """Tasks List: {tasks}
+    ("system",
+     "You are MediGuard Discharge Agent. Analyze the patient's tasks, labs, imaging and encounters and return STRICT JSON only (no markdown)."),
+    ("human",
+     """Patient: {patient}
+Tasks: {tasks}
+Labs (list): {labs}
+Imaging (list): {imaging}
+Encounters (list): {encounters}
 
-Analyze the tasks carefully and return only this JSON:
-{
-  "discharge_ready": <true/false>,
-  "blockers": [list of strings],
-  "delay_hours": <number>,
-  "priority_level": "LOW" | "MEDIUM" | "HIGH"
-}
-""")
+Return EXACTLY a JSON object with fields:
+- discharge_ready (boolean)
+- blockers (array of short strings)
+- delay_hours (number)
+- priority_level (LOW|MEDIUM|HIGH)
+
+Example output:
+{"discharge_ready": false, "blockers": ["pending_lab_results","imaging_pending"], "delay_hours": 5, "priority_level": "MEDIUM"}""")
 ])
+discharge_chain = discharge_prompt | llm
+
 
 
 # Create chains
@@ -130,25 +175,44 @@ def billing_node(state):
     }
 
 def discharge_node(state):
-    """LLM-based discharge analysis agent"""
-    
-    raw_tasks = state["raw"]["tasks"]
-    response = discharge_chain.invoke({"tasks": json.dumps(raw_tasks)})
+    """LLM-based discharge analysis agent using structured patient data"""
+    data = fetch_patient_data(state["patient_id"])
 
-    # Clean + Parse LLM JSON
+    # Build the payload (strings or JSON) — stringify lists to be safe
+    response = discharge_chain.invoke({
+        "patient": json.dumps(data["patient"]),
+        "tasks": json.dumps(data["tasks"]),
+        "labs": json.dumps(data["labs"]),
+        "imaging": json.dumps(data["imaging"]),
+        "encounters": json.dumps(data["encounters"])
+    })
+
     content = response.content.strip()
+    # strip markdown code blocks if present
     if content.startswith("```"):
         content = content.split("```")[1]
         if content.startswith("json"):
             content = content[4:]
         content = content.strip()
 
-    discharge_result = json.loads(content)
+    # Parse LLM output to JSON; handle parse errors gracefully
+    try:
+        discharge_result = json.loads(content)
+    except Exception as e:
+        # fallback: minimal structured failure output
+        discharge_result = {
+            "discharge_ready": False,
+            "blockers": ["llm_parse_error"],
+            "delay_hours": 0,
+            "priority_level": "MEDIUM",
+            "error": str(e),
+            "raw": content[:1000]
+        }
 
-    # Merge with the other agents
+    # Merge into final result (keep identity & billing keys)
     combined = {
-        **state["identity"],
-        **state["billing"],
+        **state.get("identity", {}),
+        **state.get("billing", {}),
         **discharge_result
     }
 
@@ -157,6 +221,8 @@ def discharge_node(state):
         "discharge": discharge_result,
         "final": combined
     }
+
+    
 
 
 # Build workflow
